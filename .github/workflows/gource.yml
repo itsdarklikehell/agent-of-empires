@@ -1,0 +1,59 @@
+name: Gource visualization
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'gource/**'
+      - '**.gif'
+      - '**.mp4'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gource-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gource:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Generate Gource video
+        uses: nbprojekt/gource-action@v1
+        with:
+          gource_title: Agent of Empires — session manager for AI coding agents
+          gource_resolution: 1080p
+          gource_fps: 30
+          gource_font_size: 28
+          gource_seconds_per_day: '1'
+          gource_start_date: '2024-01-01'
+          avatars_auto_fetch: true
+
+      - name: Generate GIF thumbnail
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -y \
+            -i ./gource/gource.mp4 \
+            -filter_complex "[0:v]select='not(mod(n,45))',setpts=0.1*PTS,fps=10,scale=480:-1:flags=lanczos" \
+            -fps_mode vfr \
+            ./gource/gource.gif
+
+      - name: Commit video and GIF
+        run: |
+          git config user.name "Corneel (Hermes agent)"
+          git config user.email "corneel@freedom.nl"
+          git checkout -B main origin/main
+          git add gource/gource.mp4 gource/gource.gif
+          git diff --cached --quiet && echo "No changes" || git commit -m "🎥 Update Gource visualization [skip ci]"
+          git push origin main 2>&1 || echo "Push failed (may need manual trigger on first run)"

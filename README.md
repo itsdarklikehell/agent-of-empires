@@ -137,3 +137,19 @@ One file, `src/tui/hyperlink.rs`, contains code derived from
 [herdr](https://github.com/herdrdev/herdr) under the Apache License 2.0. See
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
 [licenses/Apache-2.0.txt](licenses/Apache-2.0.txt).
+
+## 🎥 Gource Visualization
+
+De ontwikkelhistorie van dit project wordt automatisch gegenereerd door de [Gource workflow](.github/workflows/gource.yml) bij elke push — rendered via [nbprojekt/gource-action@v1](https://github.com/marketplace/actions/gource-action) in 1080p.
+
+<video src="https://raw.githubusercontent.com/itsdarklikehell/agent-of-empires/main/gource/gource.mp4" controls width="100%"></video>
+
+Lokale video genereren:
+```bash
+gource --seconds-per-day 1 -1920x1080 --auto-skip-seconds 1 \
+  --hide-users --hide-filenames --title "Agent of Empires — session manager for AI coding agents" \
+  --output-ppm-stream - --output-framerate 30 2>/dev/null | \
+ffmpeg -y -r 30 -i - -c:v libx264 -preset fast -crf 23 \
+  -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart \
+  agent-of-empires_gource_1080p.mp4 2>/dev/null
+```
