@@ -1,7 +1,8 @@
 # Release Notes
 
-## 2026-10-02
+## 2026-10-03
 
+* docs: update RELEASE_NOTES.md (b951d91d)
 * chore: add missing GitHub files (4258e080)
 * ci: add Gource visualization workflow + README section (a141765f)
 * feat(codex): resume host Codex panes from their SessionStart id (#4098) (af559889)
@@ -21,4 +22,3 @@
 * fix(session): re-probe on a schedule when a session has nothing to poll (#4141) (9dc6fcac)
 * fix(session): warn when a recorded Claude store overrides agent_config_dir (#4142) (a9da36f2)
 * fix(plugin): count only in-flight sessions against the per-plugin cap (#4120) (16ca70d1)
-* fix(session): keep Pi ownership stable before transcript publication (#4115) (e019ffd5)
