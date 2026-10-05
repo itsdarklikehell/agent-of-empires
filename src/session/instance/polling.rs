@@ -45,14 +45,16 @@ pub(super) mod probe_delay {
 }
 
 #[cfg(test)]
+type FinalPiDrainHook = Box<dyn FnOnce(&mut Instance)>;
+
+#[cfg(test)]
 thread_local! {
-    static AFTER_FINAL_PI_DRAIN: std::cell::RefCell<
-        Option<Box<dyn FnOnce(&mut Instance)>>,
-    > = std::cell::RefCell::new(None);
+    static AFTER_FINAL_PI_DRAIN: std::cell::RefCell<Option<FinalPiDrainHook>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
-fn take_after_final_pi_drain_hook() -> Option<Box<dyn FnOnce(&mut Instance)>> {
+fn take_after_final_pi_drain_hook() -> Option<FinalPiDrainHook> {
     AFTER_FINAL_PI_DRAIN.with(|hook| hook.borrow_mut().take())
 }
 
@@ -1310,9 +1312,19 @@ mod tests {
         let mut inst = Instance::new("codex-host-exec", "/tmp");
         inst.tool = "codex".to_string();
 
-        let execution = inst.resolve_native_execution(None).unwrap();
+        let capture = inst
+            .resolve_native_execution(None)
+            .map(|execution| execution.capture);
+        // Host macOS Codex is refused an execution; its Default launch reads the sidecar unbound.
+        if crate::process::HAS_CODEX_MANAGED_PREFERENCES {
+            assert_eq!(
+                format!("{:#}", capture.unwrap_err()),
+                "Codex managed preferences cannot be attested by the local file contract"
+            );
+            return;
+        }
         assert!(
-            matches!(execution.capture, Some(super::CaptureContext::Hooks(_))),
+            matches!(capture.unwrap(), Some(super::CaptureContext::Hooks(_))),
             "a host Codex launch must capture through its pane hook"
         );
     }

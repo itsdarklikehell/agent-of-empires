@@ -48,6 +48,7 @@ mod apply_session_id_updates;
 mod archive_restart_grouping;
 mod click_to_select;
 mod default_attach_mode;
+mod dialog_mouse;
 mod divider_drag;
 mod footer_toolbar;
 mod fork_rename_dialogs;
@@ -337,7 +338,7 @@ fn attention_env_running_then_idle() -> (TestEnv, usize, usize) {
 /// Flatten a rendered row into its plain text, dropping styling.
 fn rendered_row_text(view: &HomeView, item: &Item) -> String {
     let theme = crate::tui::styles::Theme::default();
-    view.render_item_line(item, false, false, &theme, 200)
+    view.render_item_line(item, false, false, &theme, 200, view.favorite_gutter())
         .spans
         .iter()
         .map(|s| s.content.as_ref())
@@ -408,6 +409,7 @@ fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> New
     NewSessionData {
         profile: "default".to_string(),
         title: title.to_string(),
+        title_typed: false,
         path: project_dir.to_str().unwrap().to_string(),
         group: group.to_string(),
         tool: "claude".to_string(),

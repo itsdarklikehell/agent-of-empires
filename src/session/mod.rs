@@ -79,16 +79,17 @@ pub(crate) use instance::{
     NEWER_GENERATION_BUSY_REASON,
 };
 pub(crate) use instance::{
-    generic_host_config_path_for, resolved_agent_for, sidecar_host_config_path_for,
-    ConversationState, ResumeAttemptPolicy, TerminalContextResume,
+    host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
+    host_hook_post_install_notes, resolved_agent_for, ConversationState, ResumeAttemptPolicy,
+    TerminalContextResume,
 };
 pub use instance::{
     is_valid_session_color, ConversationBinding, ConversationProvenance, DetectionState,
     EnsureReadyError, EnsureReadyOutcome, ExecutionBinding, ExecutionLocation, Instance,
     LaunchSidOutcome, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
     PendingInitialTurn, PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket,
-    StartOutcome, Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
-    SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
+    SessionGone, StartBlocked, StartOutcome, Status, TerminalInfo, View, WorkspaceInfo,
+    WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
 };
 #[cfg(test)]
 pub(crate) use move_journal::{
@@ -96,7 +97,7 @@ pub(crate) use move_journal::{
 };
 pub(crate) use storage::acquire_session_identity_lock;
 #[cfg(test)]
-pub(crate) use storage::observe_lock_contention_for_test;
+pub(crate) use storage::{observe_lock_contention_for_test, observe_updates_for_test};
 pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};
 
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -2,35 +2,6 @@
 
 use super::*;
 
-#[test]
-#[serial]
-fn wants_text_selection_tracks_copy_friendly_surfaces() {
-    use crate::tui::dialogs::ChangelogDialog;
-
-    let mut env = create_test_env_empty();
-
-    // Fresh dashboard: mouse capture should stay on (wheel-scroll works).
-    assert!(!env.view.wants_text_selection());
-
-    // info_dialog (e.g. an error message the user might want to copy).
-    env.view.info_dialog = Some(InfoDialog::new("Error", "something went wrong"));
-    assert!(env.view.wants_text_selection());
-    env.view.info_dialog = None;
-    assert!(!env.view.wants_text_selection());
-
-    // changelog_dialog (release notes).
-    env.view.changelog_dialog = Some(ChangelogDialog::new(Some("1.0.0".to_string())));
-    assert!(env.view.wants_text_selection());
-    env.view.changelog_dialog = None;
-    assert!(!env.view.wants_text_selection());
-
-    use crate::tui::dialogs::ServeView;
-    env.view.serve_view = Some(ServeView::new());
-    assert!(env.view.wants_text_selection());
-    env.view.serve_view = None;
-    assert!(!env.view.wants_text_selection());
-}
-
 // -- apply_one_status_update -------------------------------------------------
 //
 // #872: the polling loop runs `update_status_with_metadata` on a clone and projects the
@@ -1845,8 +1816,11 @@ fn d_with_confirm_delete_prompts_before_trashing() {
         "the pending trash target must be the selected session"
     );
 
-    // Accepting the dialog trashes via the same trash_session_by_id path.
-    env.view.dispatch_confirm_submit("trash_session");
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(screen.contains("Press d again to confirm"), "{screen}");
+
+    // A second `d` accepts, trashing via the same trash_session_by_id path.
+    env.view.handle_key(key(KeyCode::Char('d')), None);
     assert!(
         env.view.get_instance(&id).unwrap().is_trashed(),
         "accepting the confirm dialog must trash the session"

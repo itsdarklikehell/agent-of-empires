@@ -22,7 +22,8 @@ pub enum ContextMenuAction {
     /// Open the new-session dialog (`'n'`).
     NewSession,
     /// New session prefilled from the right-clicked row (`'N'`): a session row
-    /// inherits its repo path and group, a project or group row a member's path.
+    /// inherits its repo path, group, agent and view, and its sandbox when it has
+    /// one; a project or group row a member's path.
     NewFromSelection,
     /// Fork the session into an independent one resuming its conversation.
     Fork,
@@ -44,6 +45,8 @@ pub enum ContextMenuAction {
     RestoreAll,
     /// Collapse or expand the section the menu was opened on.
     ToggleSectionCollapse,
+    /// Restore a trashed session.
+    Restore,
 }
 
 pub struct ContextMenuDialog {
@@ -127,6 +130,17 @@ impl ContextMenuDialog {
         Self::new(anchor, items)
     }
 
+    /// A trashed row can only come back out or be deleted for good.
+    pub fn for_trashed_session(anchor: (u16, u16)) -> Self {
+        Self::new(
+            anchor,
+            vec![
+                (ContextMenuAction::Restore, "Restore"),
+                (ContextMenuAction::Delete, "Delete"),
+            ],
+        )
+    }
+
     pub fn for_group(anchor: (u16, u16)) -> Self {
         Self::new(
             anchor,
@@ -202,6 +216,10 @@ impl ContextMenuDialog {
             anchor,
             last_area: Rect::default(),
         }
+    }
+
+    fn has(&self, action: ContextMenuAction) -> bool {
+        self.items.iter().any(|(item, _)| *item == action)
     }
 
     /// The action `Enter` would submit, falling back to the first item when
@@ -308,7 +326,14 @@ impl ContextMenuDialog {
                 let action = match c {
                     'r' | 'R' => Some(ContextMenuAction::Rename),
                     'd' | 'D' => Some(ContextMenuAction::Delete),
-                    'z' | 'Z' => Some(ContextMenuAction::ToggleArchive),
+                    // `z` restores a trashed row, as it does outside the menu.
+                    'z' | 'Z' => {
+                        if self.has(ContextMenuAction::Restore) {
+                            Some(ContextMenuAction::Restore)
+                        } else {
+                            Some(ContextMenuAction::ToggleArchive)
+                        }
+                    }
                     'h' | 'H' => Some(ContextMenuAction::ToggleSnooze),
                     'u' | 'U' => Some(ContextMenuAction::ToggleUnread),
                     // `n` opens a new session from whichever new-session entry
@@ -316,11 +341,7 @@ impl ContextMenuDialog {
                     // prefills from the row (NewFromSelection), the empty-sidebar
                     // menu opens a blank one (NewSession).
                     'n' | 'N' => {
-                        if self
-                            .items
-                            .iter()
-                            .any(|(item, _)| *item == ContextMenuAction::NewFromSelection)
-                        {
+                        if self.has(ContextMenuAction::NewFromSelection) {
                             Some(ContextMenuAction::NewFromSelection)
                         } else {
                             Some(ContextMenuAction::NewSession)
@@ -333,9 +354,7 @@ impl ContextMenuDialog {
                     _ => None,
                 };
                 match action {
-                    Some(a) if self.items.iter().any(|(item, _)| *item == a) => {
-                        DialogResult::Submit(a)
-                    }
+                    Some(a) if self.has(a) => DialogResult::Submit(a),
                     _ => DialogResult::Continue,
                 }
             }

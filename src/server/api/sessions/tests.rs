@@ -2546,7 +2546,7 @@ async fn the_retention_purge_takes_submission_before_the_instance_lock() {
     let _home = crate::session::test_support::isolate_app_dir();
     std::fs::write(
         crate::session::get_app_dir().unwrap().join("config.toml"),
-        "[session]\ntrash_retention_days = 1\n",
+        "[session]\ntrash_retention_minutes = 60\n",
     )
     .unwrap();
     let mut inst = make_test_instance();
@@ -2854,11 +2854,11 @@ async fn diff_file_rejects_workspace_with_no_repos() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-/// "Open file" in the diff list: the raw route serves the selected repo's
-/// current worktree bytes, typed so passive files render in the tab while
-/// scriptable or unrenderable ones download, and refuses whatever the confined
+/// "Open file" in the diff list and the Files pane: each raw route serves a
+/// file's current bytes, typed so passive files render in the tab while
+/// scriptable or unrenderable ones download, and refuses whatever its confined
 /// reader refuses.
-mod diff_file_raw {
+mod open_file {
     use super::*;
     use axum::body::to_bytes;
     use axum::extract::Query;
@@ -2878,6 +2878,39 @@ mod diff_file_raw {
         inst
     }
 
+    /// A workspace rooted at `dir` whose members each hold a `same.txt` naming
+    /// their repo.
+    fn workspace(dir: &std::path::Path, names: &[&str]) -> Instance {
+        let repos = names
+            .iter()
+            .map(|name| {
+                let worktree = dir.join(name);
+                std::fs::create_dir(&worktree).unwrap();
+                std::fs::write(worktree.join("same.txt"), name).unwrap();
+                crate::session::WorkspaceRepo {
+                    name: name.to_string(),
+                    source_path: format!("/src/{name}"),
+                    branch: "feature/x".to_string(),
+                    worktree_path: worktree.to_string_lossy().into_owned(),
+                    main_repo_path: format!("/src/{name}"),
+                    managed_by_aoe: true,
+                    branch_preexisting: false,
+                    base_branch: None,
+                    base_branch_override: None,
+                }
+            })
+            .collect();
+        let mut inst = single_repo(dir);
+        inst.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "feature/x".to_string(),
+            workspace_dir: dir.to_string_lossy().into_owned(),
+            repos,
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+        inst
+    }
+
     async fn get(
         state: &Arc<crate::server::AppState>,
         id: &str,
@@ -2894,6 +2927,24 @@ mod diff_file_raw {
         )
         .await
         .into_response()
+    }
+
+    /// `raw` picks the Files pane's "Open file" route over its viewer's read.
+    async fn get_session_file(
+        state: &Arc<crate::server::AppState>,
+        id: &str,
+        path: &str,
+        raw: bool,
+    ) -> axum::response::Response {
+        let (state, id) = (State(state.clone()), Path(id.to_string()));
+        let query = Query(SessionFileQuery {
+            path: path.to_string(),
+        });
+        if raw {
+            session_file_raw(state, id, query).await.into_response()
+        } else {
+            session_file(state, id, query).await.into_response()
+        }
     }
 
     #[tokio::test]
@@ -3030,31 +3081,7 @@ mod diff_file_raw {
     #[tokio::test]
     async fn reads_from_the_named_workspace_repo() {
         let ws = tempfile::tempdir().unwrap();
-        let member = |name: &str| {
-            let worktree = ws.path().join(name);
-            std::fs::create_dir(&worktree).unwrap();
-            std::fs::write(worktree.join("same.txt"), name).unwrap();
-            crate::session::WorkspaceRepo {
-                name: name.to_string(),
-                source_path: format!("/src/{name}"),
-                branch: "feature/x".to_string(),
-                worktree_path: worktree.to_string_lossy().into_owned(),
-                main_repo_path: format!("/src/{name}"),
-                managed_by_aoe: true,
-                branch_preexisting: false,
-                base_branch: None,
-                base_branch_override: None,
-            }
-        };
-        let mut inst = single_repo(ws.path());
-        inst.workspace_info = Some(crate::session::WorkspaceInfo {
-            branch: "feature/x".to_string(),
-            workspace_dir: ws.path().to_string_lossy().into_owned(),
-            repos: vec![member("api"), member("web")],
-            created_at: chrono::Utc::now(),
-            cleanup_on_delete: true,
-        });
-        let state = state_for(inst, false);
+        let state = state_for(workspace(ws.path(), &["api", "web"]), false);
 
         for (repo, expected) in [(Some("web"), "web"), (Some("api"), "api"), (None, "api")] {
             let resp = get(&state, "raw", "same.txt", repo).await;
@@ -3062,6 +3089,104 @@ mod diff_file_raw {
             let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
             assert_eq!(&body[..], expected.as_bytes(), "repo={repo:?}");
         }
+    }
+
+    /// The Files pane lists paths relative to the session root, which in a
+    /// workspace holds the repos, so its reads must resolve there too.
+    #[tokio::test]
+    async fn files_pane_reads_resolve_against_the_session_root() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("NOTES.md"), "notes").unwrap();
+        let state = state_for(workspace(ws.path(), &["api", "web"]), false);
+
+        for raw in [false, true] {
+            for (path, expected) in [("NOTES.md", "notes"), ("web/same.txt", "web")] {
+                let resp = get_session_file(&state, "raw", path, raw).await;
+                assert_eq!(resp.status(), StatusCode::OK, "raw={raw} {path}");
+                let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                let content = if raw {
+                    String::from_utf8(body.to_vec()).unwrap()
+                } else {
+                    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    json["content"].as_str().unwrap().to_string()
+                };
+                assert_eq!(content, expected, "raw={raw} {path}");
+            }
+        }
+    }
+
+    /// Unlike the diff route, the Files pane's raw route takes what its viewer
+    /// takes: an absolute path under the root, or an outside file the agent
+    /// touched this session.
+    #[tokio::test]
+    async fn files_pane_raw_serves_what_the_viewer_may_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let (touched, secret) = (
+            outside.path().join("plan.md"),
+            outside.path().join("secret"),
+        );
+        std::fs::write(&touched, "plan").unwrap();
+        std::fs::write(&secret, "KEY").unwrap();
+        std::os::unix::fs::symlink(&secret, dir.path().join("link")).unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let page = dir.path().join("sub/page.html");
+        std::fs::write(&page, "<script>alert(1)</script>").unwrap();
+        let state = state_for(single_repo(dir.path()), false);
+        let tool_call = crate::acp::state::ToolCall {
+            id: "t1".to_string(),
+            name: "Write".to_string(),
+            kind: "edit".to_string(),
+            args_preview: serde_json::json!({ "file_path": &touched }).to_string(),
+            started_at: chrono::Utc::now(),
+            parent_tool_call_id: None,
+            memory_recall: None,
+            diffs: Vec::new(),
+        };
+        state
+            .acp_event_store
+            .record(
+                "raw",
+                1,
+                &crate::acp::state::Event::ToolCallStarted { tool_call },
+            )
+            .unwrap();
+
+        // (path, status, Content-Disposition)
+        for (path, status, disposition) in [
+            ("sub/page.html", StatusCode::OK, Some("attachment")),
+            (page.to_str().unwrap(), StatusCode::OK, Some("attachment")),
+            (touched.to_str().unwrap(), StatusCode::OK, None),
+            (secret.to_str().unwrap(), StatusCode::FORBIDDEN, None),
+            ("link", StatusCode::FORBIDDEN, None),
+            ("../secret", StatusCode::BAD_REQUEST, None),
+            ("sub", StatusCode::BAD_REQUEST, None),
+            ("deleted.txt", StatusCode::NOT_FOUND, None),
+        ] {
+            let resp = get_session_file(&state, "raw", path, true).await;
+            assert_eq!(resp.status(), status, "{path}");
+            assert_eq!(
+                resp.headers()
+                    .get(header::CONTENT_DISPOSITION)
+                    .map(|v| v.to_str().unwrap()),
+                disposition,
+                "{path}"
+            );
+        }
+
+        assert_eq!(
+            get_session_file(&state, "missing", "sub/page.html", true)
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let cityhall = state_for(single_repo(dir.path()), true);
+        assert_eq!(
+            get_session_file(&cityhall, "raw", "sub/page.html", true)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
     }
 }
 
@@ -3090,6 +3215,335 @@ async fn send_message_refreshes_instance_after_instance_lock() {
         StatusCode::NOT_FOUND
     );
 }
+/// #4116: a container terminal for an archived or trashed sandboxed session is refused before
+/// its container is started, and a purged row reads as gone.
+#[tokio::test]
+#[serial_test::serial]
+async fn container_terminal_refuses_archived_trashed_and_purged_sessions() {
+    use axum::body::to_bytes;
+    let _home = crate::session::test_support::isolate_app_dir();
+    type Case = (Option<fn(&mut Instance)>, StatusCode, &'static str);
+    let cases: [Case; 3] = [
+        (
+            Some(Instance::archive),
+            StatusCode::CONFLICT,
+            "session_archived",
+        ),
+        (
+            Some(Instance::trash),
+            StatusCode::CONFLICT,
+            "session_trashed",
+        ),
+        (None, StatusCode::NOT_FOUND, ""),
+    ];
+    for (shelve, status, code) in cases {
+        let mut inst = make_test_instance();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "ubuntu:latest".to_string(),
+            container_name: "aoe-4116-never-started".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+        let stored = match shelve {
+            Some(shelve) => {
+                let mut row = inst.clone();
+                shelve(&mut row);
+                vec![row]
+            }
+            None => Vec::new(),
+        };
+        crate::server::test_support::seed_instances_on_disk_for_test(&inst.source_profile, stored);
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let response = ensure_container_terminal(
+            State(state),
+            Path(id),
+            axum::extract::Query(crate::server::live_ws::TerminalIndexQuery { index: 0 }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), status, "{code}");
+        if !code.is_empty() {
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"], code);
+        }
+    }
+}
+
+/// #4116: the web start, attach-ensure and send-revive endpoints refuse to launch an archived or
+/// trashed session, and leave its status alone.
+#[tokio::test]
+async fn start_paths_refuse_archived_and_trashed_sessions() {
+    use axum::body::to_bytes;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let shelves: [(fn(&mut Instance), &str, &str); 2] = [
+        (
+            Instance::archive,
+            "session_archived",
+            "session is archived; unarchive it first",
+        ),
+        (
+            Instance::trash,
+            "session_trashed",
+            "session is in trash; restore it first",
+        ),
+    ];
+    for (shelve, code, message) in shelves {
+        for which in ["start", "ensure", "send"] {
+            let mut inst = make_test_instance();
+            shelve(&mut inst);
+            inst.status = Status::Stopped;
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let response = match which {
+                "start" => start_session(State(state.clone()), Path(id.clone()))
+                    .await
+                    .into_response(),
+                "ensure" => ensure_session(State(state.clone()), Path(id.clone()))
+                    .await
+                    .into_response(),
+                _ => send_message(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    Ok(Json(SendMessageRequest {
+                        message: "hello".into(),
+                        revive: true,
+                    })),
+                )
+                .await
+                .into_response(),
+            };
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{which} {code}");
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"], code, "{which}");
+            assert_eq!(body["message"], message, "{which}");
+            let after = &state.instances.read().await[0];
+            assert_eq!(after.status, Status::Stopped, "{which} {code}");
+            assert!(!after.tmux_session().unwrap().exists(), "{which} {code}");
+        }
+    }
+}
+
+/// #4116: a peer (e.g. `aoe session archive`) can shelve the stored row after the daemon's
+/// memory check. Structured start and prompt-wake recheck that row inside their write, refuse,
+/// and leave `archived_at` in place.
+#[tokio::test]
+#[serial_test::serial]
+async fn structured_start_and_prompt_wake_recheck_the_stored_row() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let profile = "default";
+    for which in ["start", "prompt"] {
+        let mut inst = Instance::new("peer-archived", "/tmp/aoe-4116-peer");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        inst.status = Status::Stopped;
+        // Snoozed in memory so the prompt path would wake (and persist) it.
+        inst.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+        let id = inst.id.clone();
+        let mut peer = inst.clone();
+        peer.archive();
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = vec![peer];
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let refused = match which {
+            "start" => {
+                start_session(State(state.clone()), Path(id.clone()))
+                    .await
+                    .into_response()
+                    .status()
+                    == StatusCode::CONFLICT
+            }
+            _ => matches!(
+                state
+                    .session_service
+                    .touch_and_wake_on_prompt(&id, false)
+                    .await,
+                crate::server::session_service::PromptTouch::Blocked(
+                    crate::session::StartBlocked::Archived
+                )
+            ),
+        };
+        assert!(refused, "{which} must refuse a row archived on disk");
+        let stored = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap();
+        assert!(
+            stored.is_archived(),
+            "{which} must not clear the peer's archive"
+        );
+        assert_eq!(
+            stored.status,
+            Status::Stopped,
+            "{which} must not mark it Idle"
+        );
+    }
+}
+
+/// #4116: `/start` answers from the stored row, not a stale cache: a row a peer archived is
+/// refused and a purged one is not found, whether or not the cached session is stopped.
+#[tokio::test]
+#[serial_test::serial]
+async fn start_rechecks_the_stored_row() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let profile = "default";
+    let cases = [
+        (
+            "stopped structured, purged",
+            Status::Stopped,
+            true,
+            false,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "running, archived on disk",
+            Status::Running,
+            false,
+            true,
+            StatusCode::CONFLICT,
+        ),
+        (
+            "running, purged",
+            Status::Running,
+            false,
+            false,
+            StatusCode::NOT_FOUND,
+        ),
+    ];
+    for (label, status, structured, stored_row, want) in cases {
+        let mut inst = Instance::new("stale-cache", "/tmp/aoe-4116-stale");
+        inst.source_profile = profile.to_string();
+        inst.status = status;
+        if structured {
+            inst.view = crate::session::View::Structured;
+        }
+        let id = inst.id.clone();
+        let mut peer = inst.clone();
+        peer.archive();
+        Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|rows, _| {
+                *rows = if stored_row { vec![peer] } else { Vec::new() };
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let response = start_session(State(state.clone()), Path(id.clone()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), want, "{label}");
+        assert_eq!(state.instances.read().await[0].status, status, "{label}");
+    }
+}
+
+/// #4116: web `/send` rechecks the stored row under the lifecycle lock, so a peer's archive or
+/// purge of a session with a live pane refuses the keystrokes, and an archive survives the send.
+#[tokio::test]
+#[serial_test::serial]
+async fn send_refuses_a_live_pane_a_peer_shelved() {
+    if crate::tmux::tmux_command().arg("-V").output().is_err() {
+        eprintln!("tmux not available; skipping");
+        return;
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    let profile = "default";
+    for (stored_row, want) in [(true, StatusCode::CONFLICT), (false, StatusCode::NOT_FOUND)] {
+        let mut inst = make_test_instance();
+        inst.source_profile = profile.to_string();
+        let id = inst.id.clone();
+        let mut peer = inst.clone();
+        peer.archive();
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = if stored_row { vec![peer] } else { Vec::new() };
+                Ok(())
+            })
+            .unwrap();
+        let pane = crate::tmux::Session::generate_name(&id, &inst.title);
+        let created = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &pane, "sleep", "60"])
+            .status();
+        if !created.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("tmux new-session failed; skipping");
+            return;
+        }
+        crate::tmux::refresh_session_cache();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let response = send_message(
+            State(state.clone()),
+            Path(id.clone()),
+            Ok(Json(SendMessageRequest {
+                message: "hello".into(),
+                revive: false,
+            })),
+        )
+        .await
+        .into_response();
+        let _ = crate::tmux::tmux_command()
+            .args(["kill-session", "-t", &pane])
+            .output();
+        assert_eq!(response.status(), want, "stored_row={stored_row}");
+        if stored_row {
+            assert!(storage.load().unwrap()[0].is_archived());
+        }
+    }
+}
+
+/// #4116: web archive persists under the lifecycle lock `aoe send` holds while it types, so an
+/// archive cannot land mid-send; it waits for the send, then applies.
+#[test]
+#[serial_test::serial]
+fn archive_persist_waits_for_an_in_flight_send() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let profile = "default";
+    let mut inst = make_test_instance();
+    inst.source_profile = profile.to_string();
+    let id = inst.id.clone();
+    let storage = Storage::new_unwatched(profile).unwrap();
+    storage
+        .update(|rows, _| {
+            *rows = vec![inst.clone()];
+            Ok(())
+        })
+        .unwrap();
+    let stored_archived = || storage.load().unwrap()[0].is_archived();
+
+    let sending = inst.lock_for_input().unwrap();
+    let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+    let archive = std::thread::spawn(move || {
+        let _observer = crate::session::observe_lock_contention_for_test(contended_tx);
+        let storage = Storage::new_unwatched(profile).unwrap();
+        super::update::persist_blocking(&storage, Some(&id), |rows| rows[0].archive())
+    });
+    contended_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the archive must reach the lock the send holds");
+    assert!(!stored_archived(), "the archive must wait for the send");
+
+    drop(sending);
+    archive.join().unwrap().unwrap();
+    assert!(stored_archived());
+}
+
 // Regression for a path-traversal vulnerability in the first cut of
 // `/api/sessions/{id}/diff/file?path=...`, where any authenticated user could
 // pass `?path=/etc/passwd` and have the server dump it in a diff response.
@@ -3451,6 +3905,34 @@ fn resolve_hook_plan_refuses_untrusted_repo_hooks_until_trusted() {
             "already-trusted repo needs no new trust record"
         );
     }
+}
+
+#[test]
+#[serial_test::serial]
+fn run_create_hooks_forwards_the_running_hook_and_its_output_to_progress() {
+    let temp_home = tempfile::tempdir().unwrap();
+    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+    let project = project_with_on_create_hooks(&["echo from-the-hook"]);
+    let plan = resolve_create_hook_plan("default", project.path(), false, true).unwrap();
+    let registry = crate::server::create_progress::CreateProgressRegistry::default();
+    let registration = registry.register("key");
+    let mut instance = Instance::new("hooked", project.path().to_str().unwrap());
+
+    run_create_hooks(
+        &mut instance,
+        &plan,
+        project.path(),
+        Some(&registration.progress),
+    )
+    .unwrap();
+
+    let snapshot = registry.snapshot("key").unwrap();
+    assert_eq!(snapshot.hook.as_deref(), Some("echo from-the-hook"));
+    assert!(
+        snapshot.output.iter().any(|l| l.contains("from-the-hook")),
+        "{:?}",
+        snapshot.output
+    );
 }
 
 /// None of these refuse a create. A scratch session has no repo config anchor,
@@ -3848,4 +4330,272 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
             .iter()
             .all(|i| i.id != owner.id));
     }
+}
+
+async fn post_create(
+    state: &std::sync::Arc<AppState>,
+    body: serde_json::Value,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use axum::response::IntoResponse;
+    let response = create_session(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(CreateSessionQuery { wait: None }),
+        Ok(axum::Json(serde_json::from_value(body).unwrap())),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ready() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// A client that drops mid-create (a backgrounded mobile tab) must not abandon
+/// it, and its same-key retry joins the running create instead of starting another.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let gate = tempfile::tempdir().unwrap();
+    let (ready, release) = (gate.path().join("ready"), gate.path().join("release"));
+    let hook = format!(
+        ": > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done; echo hook-done",
+        ready.display(),
+        release.display()
+    );
+    let project = project_with_on_create_hooks(&[hook.as_str()]);
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, _launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let body = serde_json::json!({
+        "title": "detached-create", "path": project.path(), "tool": "claude",
+        "view": "structured", "profile": "test", "trust_hooks": true,
+        "idempotency_key": "drop-me",
+    });
+
+    let first = tokio::spawn({
+        let (state, body) = (state.clone(), body.clone());
+        async move { post_create(&state, body).await }
+    });
+    wait_for("the on_create hook to start", || ready.exists()).await;
+    let progress = state
+        .create_progress
+        .snapshot("drop-me")
+        .expect("progress while running");
+    assert_eq!(progress.hook.as_deref(), Some(hook.as_str()));
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+
+    let retry = tokio::spawn({
+        let state = state.clone();
+        async move { post_create(&state, body).await }
+    });
+    std::fs::write(&release, "").unwrap();
+    let (status, session) = retry.await.unwrap();
+
+    assert_eq!(status, axum::http::StatusCode::OK, "{session}");
+    let rows = support::load_instances_from_disk_for_test("test");
+    let created: Vec<_> = rows
+        .iter()
+        .filter(|r| r.title == "detached-create")
+        .collect();
+    assert_eq!(
+        created.len(),
+        1,
+        "the retry must not create a second session"
+    );
+    assert_eq!(session["id"], created[0].id.as_str());
+    assert!(state.create_progress.snapshot("drop-me").is_none());
+}
+
+/// A retry whose first response was lost gets that failure back rather than
+/// running the create again; a fresh key runs it.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_failed_create_is_replayed_to_a_same_key_retry() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, _launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let parent = tempfile::tempdir().unwrap();
+    let path = parent.path().join("later");
+    let body = |key: &str| {
+        serde_json::json!({
+            "title": "replayed", "path": path, "tool": "claude",
+            "view": "structured", "profile": "test", "idempotency_key": key,
+        })
+    };
+
+    let (status, failed) = post_create(&state, body("k1")).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
+    // A re-run would now succeed, so a matching 400 proves the replay.
+    std::fs::create_dir_all(&path).unwrap();
+    assert_eq!(post_create(&state, body("k1")).await, (status, failed));
+    let (fresh, session) = post_create(&state, body("k2")).await;
+    assert_eq!(fresh, axum::http::StatusCode::CREATED, "{session}");
+}
+
+/// A full replay map must not forget a live failure: its retry would run the create,
+/// and its hooks, a second time. New keyed creates are refused instead.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let marker = tempfile::tempdir().unwrap();
+    let runs = marker.path().join("runs");
+    let hook = format!("echo run >> '{}'; exit 1", runs.display());
+    let project = project_with_on_create_hooks(&[hook.as_str()]);
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, _launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let body = |key: &str| {
+        serde_json::json!({
+            "title": "hook-fails", "path": project.path(), "tool": "claude",
+            "view": "structured", "profile": "test", "trust_hooks": true,
+            "idempotency_key": key,
+        })
+    };
+    let hook_runs = || {
+        std::fs::read_to_string(&runs)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+
+    let (status, failed) = post_create(&state, body("oldest")).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
+    assert_eq!(hook_runs(), 1);
+
+    // More live failures than the map holds.
+    for n in 0..5000 {
+        state.create_progress.record_failure(
+            &format!("filler-{n}"),
+            crate::server::create_progress::CreateFailure {
+                status: axum::http::StatusCode::BAD_REQUEST,
+                code: "create_failed",
+                message: "filler".to_string(),
+            },
+        );
+    }
+
+    assert_eq!(post_create(&state, body("oldest")).await, (status, failed));
+    let (full, refused) = post_create(&state, body("fresh")).await;
+    assert_eq!(
+        full,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "{refused}"
+    );
+    assert_eq!(hook_runs(), 1, "neither retry may run the create again");
+}
+
+/// A daemon restart empties the in-memory replay record. A same-key retry that names the
+/// earlier run must then be refused as unknown, not run again with its hooks.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_retry_across_a_daemon_restart_never_reruns_a_failed_create() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let marker = tempfile::tempdir().unwrap();
+    let side_effects = marker.path().join("side-effects");
+    // The first hook leaves an external side effect, the second fails.
+    let effect = format!("echo effect >> '{}'", side_effects.display());
+    let project = project_with_on_create_hooks(&[effect.as_str(), "exit 1"]);
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let effects = || {
+        std::fs::read_to_string(&side_effects)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let body = |origin: Option<&str>| {
+        serde_json::json!({
+            "title": "restart", "path": project.path(), "tool": "claude",
+            "view": "structured", "profile": "test", "trust_hooks": true,
+            "idempotency_key": "across-restart", "retry_origin": origin,
+        })
+    };
+
+    let (launcher, _) = support::counting_failing_launcher();
+    let before = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let first_run = before.create_progress.boot_id().to_string();
+    let (status, _) = post_create(&before, body(None)).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(effects(), 1);
+
+    // The response was lost and the daemon restarted.
+    let (launcher, _) = support::counting_failing_launcher();
+    let after = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    assert_ne!(after.create_progress.boot_id(), first_run);
+    let (status, refused) = post_create(&after, body(Some(&first_run))).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"], "create_outcome_unknown");
+    assert_eq!(effects(), 1, "the retry must not run the hooks again");
+
+    // A retry that names this run is not fenced: this run would know the key if it ran.
+    let own = after.create_progress.boot_id().to_string();
+    let (status, _) = post_create(&after, body(Some(&own))).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(effects(), 2);
+}
+
+/// Validation that reads mutable state must not answer a retry the restart fence owns:
+/// with the first attempt's profile deleted after the restart, the retry is still an
+/// unknown outcome, not a definitive `profile_not_found`, and no hook runs again.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let marker = tempfile::tempdir().unwrap();
+    let side_effects = marker.path().join("side-effects");
+    let effect = format!("echo effect >> '{}'", side_effects.display());
+    let project = project_with_on_create_hooks(&[effect.as_str(), "exit 1"]);
+    // A second profile, since the last one cannot be deleted.
+    crate::session::create_profile("keep").unwrap();
+    crate::session::create_profile("work").unwrap();
+    support::seed_instances_on_disk_for_test("work", Vec::new());
+    let effects = || {
+        std::fs::read_to_string(&side_effects)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let body = |origin: Option<&str>| {
+        serde_json::json!({
+            "title": "gone-profile", "path": project.path(), "tool": "claude",
+            "view": "structured", "profile": "work", "trust_hooks": true,
+            "idempotency_key": "profile-then-restart", "retry_origin": origin,
+        })
+    };
+
+    let (launcher, _) = support::counting_failing_launcher();
+    let before = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let first_run = before.create_progress.boot_id().to_string();
+    let (status, _) = post_create(&before, body(None)).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(effects(), 1);
+
+    // The response was lost, the daemon restarted, and the profile was deleted.
+    crate::session::delete_profile("work").unwrap();
+    let (launcher, _) = support::counting_failing_launcher();
+    let after = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let (status, refused) = post_create(&after, body(Some(&first_run))).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"], "create_outcome_unknown");
+    assert_eq!(effects(), 1);
 }

@@ -159,6 +159,7 @@ impl Instance {
             if restart && stored.agent_session_id == self.agent_session_id {
                 stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
             }
+            stored.first_launch_names_agent = false;
             stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
             Ok(true)
         })?;
@@ -168,6 +169,7 @@ impl Instance {
             self.id
         );
         self.lifecycle_reservation = None;
+        self.first_launch_names_agent = false;
         Ok(())
     }
 
@@ -301,12 +303,39 @@ impl Instance {
             }
         };
         self.reconcile_from_disk();
+        if let Err(blocked) = self.ensure_startable() {
+            self.release_blocked_launch(storage);
+            return Err(blocked.into());
+        }
         if let Err(error) = hook_result {
             self.fail_reserved_launch(storage, &error, false);
             return Err(error);
         }
         self.ensure_reservation_current_or_fail(storage)?;
         Ok((title_lock, lifecycle_lock))
+    }
+
+    /// A peer archived or trashed the row while hooks ran: drop the launch reservation
+    /// without stamping an error, since the refusal is not a launch failure.
+    fn release_blocked_launch(&mut self, storage: &crate::session::storage::Storage) {
+        let live_pane = self
+            .tmux_session()
+            .is_ok_and(|session| session.exists() && !session.is_pane_dead());
+        let status = if live_pane {
+            Status::Idle
+        } else {
+            Status::Stopped
+        };
+        // The commit releases only a reservation this launch still owns.
+        if let Err(error) =
+            self.commit_lifecycle_status(storage, LifecycleOperation::Launch, status)
+        {
+            tracing::warn!(
+                target: "session.store",
+                session = %self.id,
+                "could not release the launch reservation of a refused start: {error:#}"
+            );
+        }
     }
 
     fn lifecycle_reservation_is_current(
@@ -610,6 +639,54 @@ mod tests {
         assert!(
             leftover.is_none(),
             "a failed launch must clear its reservation even after a same-generation status drift"
+        );
+    }
+
+    /// The typed title names the agent on the first launch only: the commit clears it on disk,
+    /// and a copy still holding it (the TUI's row) reloads from disk before its own launch.
+    #[test]
+    #[serial_test::serial]
+    fn the_first_launch_commit_spends_the_agent_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "lifecycle-agent-name";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let mut first = Instance::new("first", "/tmp/test");
+        first.source_profile = profile.into();
+        first.first_launch_names_agent = true;
+        let mut held_copy = first.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(first.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        first
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
+            .unwrap();
+        assert!(
+            first.first_launch_names_agent,
+            "the launch being built still carries it"
+        );
+        first.commit_lifecycle_launch(&storage, false).unwrap();
+        let disk = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == first.id)
+            .unwrap();
+        assert!(!disk.first_launch_names_agent);
+        assert!(!first.first_launch_names_agent);
+
+        assert!(held_copy.try_reconcile_from_disk().unwrap());
+        assert!(
+            !held_copy.first_launch_names_agent,
+            "a restart from a stale copy must not name the agent again"
         );
     }
 

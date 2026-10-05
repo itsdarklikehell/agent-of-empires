@@ -53,6 +53,33 @@ pub(super) fn remote_serve_url_contents(
     format!("{remote_url}\nlocalhost\t{loopback_url}\n")
 }
 
+/// Sleep until the retention sweep started at `swept_at` is due again, waking
+/// at least every [`SWEEP_RECHECK`](crate::session::trash::SWEEP_RECHECK) to
+/// re-read `interval`: a shortened window comes from the TUI or a hand edit as
+/// often as from this daemon. False on shutdown.
+async fn wait_for_trash_sweep<F, Fut>(
+    swept_at: tokio::time::Instant,
+    mut interval: F,
+    shutdown: &CancellationToken,
+) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Duration>,
+{
+    let mut due = swept_at + interval().await;
+    loop {
+        let recheck = tokio::time::Instant::now() + crate::session::trash::SWEEP_RECHECK;
+        tokio::select! {
+            _ = tokio::time::sleep_until(due.min(recheck)) => {}
+            _ = shutdown.cancelled() => return false,
+        }
+        due = swept_at + interval().await;
+        if tokio::time::Instant::now() >= due {
+            return true;
+        }
+    }
+}
+
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Post-signal shutdown.
@@ -172,6 +199,26 @@ fn check_auth_gate(
         auth_mode.as_cli_str()
     )
 }
+
+/// systemd `Type=notify` readiness. No-op unless `NOTIFY_SOCKET` is set.
+#[cfg(unix)]
+fn notify_ready(status: &str) {
+    use sd_notify::NotifyState;
+    if let Err(e) = sd_notify::notify(&[NotifyState::Ready, NotifyState::Status(status)]) {
+        tracing::warn!(target: "serve.lifecycle", "sd_notify READY failed: {e}");
+    }
+}
+
+#[cfg(unix)]
+fn notify_stopping() {
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
+}
+
+#[cfg(not(unix))]
+fn notify_ready(_status: &str) {}
+
+#[cfg(not(unix))]
+fn notify_stopping() {}
 
 pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let ServerConfig {
@@ -614,6 +661,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         allowed_origins,
         instance_locks,
         idempotency_locks,
+        create_progress: Default::default(),
         list_sessions_resolver_misses: std::sync::atomic::AtomicUsize::new(0),
         smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -710,24 +758,26 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                 crate::server::api::reconcile_trashed_worktrees(&sweep_state).await;
                 // Same one-shot startup slot.
                 crate::server::api::reconcile_worktree_paths(&sweep_state).await;
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    tokio::select! {
-                        _ = interval.tick() => {
-                            crate::server::api::purge_expired_trash(&sweep_state).await;
-                            // Q5.
-                            let store = sweep_state.acp_event_store.clone();
-                            let pruned = tokio::task::spawn_blocking(move || {
-                                store.prune_pending_attachments_older_than(PENDING_ATTACHMENT_TTL)
-                            })
+                    let swept_at = tokio::time::Instant::now();
+                    crate::server::api::purge_expired_trash(&sweep_state).await;
+                    // Q5.
+                    let store = sweep_state.acp_event_store.clone();
+                    let pruned = tokio::task::spawn_blocking(move || {
+                        store.prune_pending_attachments_older_than(PENDING_ATTACHMENT_TTL)
+                    })
+                    .await
+                    .unwrap_or(0);
+                    if pruned > 0 {
+                        tracing::info!(target: "acp.queue", pruned, "pruned stale queued-prompt attachments past TTL");
+                    }
+                    let interval = || async {
+                        tokio::task::spawn_blocking(crate::server::api::trash_sweep_interval)
                             .await
-                            .unwrap_or(0);
-                            if pruned > 0 {
-                                tracing::info!(target: "acp.queue", pruned, "pruned stale queued-prompt attachments past TTL");
-                            }
-                        }
-                        _ = shutdown.cancelled() => break,
+                            .unwrap_or(Duration::from_secs(60 * 60))
+                    };
+                    if !wait_for_trash_sweep(swept_at, interval, &shutdown).await {
+                        break;
                     }
                 }
             },
@@ -897,6 +947,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
         }
+        notify_stopping();
         let plugin_host = shutdown_state.plugin_host.clone();
         run_shutdown_sequence(
             &shutdown_state.shutdown,
@@ -910,6 +961,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         )
         .await;
     };
+
+    notify_ready(&format!("listening on {addr}"));
 
     axum::serve(
         listener,
@@ -1022,6 +1075,60 @@ async fn remote_rotation_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn notify_ready_sends_ready_and_status_to_notify_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify.sock");
+        let socket = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        std::env::set_var("NOTIFY_SOCKET", &path);
+
+        notify_ready("listening on 127.0.0.1:1");
+
+        let mut buf = [0u8; 256];
+        let n = socket.recv(&mut buf).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&buf[..n]).unwrap(),
+            "READY=1\nSTATUS=listening on 127.0.0.1:1\n"
+        );
+    }
+
+    /// The sweep fires at its interval, not the next recheck, and a window
+    /// shortened mid-wait applies at the next recheck.
+    #[tokio::test(start_paused = true)]
+    async fn trash_sweep_wakes_at_the_interval_or_the_next_recheck() {
+        let secs = Duration::from_secs;
+        // (case, interval on each read, expected wait)
+        let cases: [(&str, &[u64], Duration); 3] = [
+            ("15-minute window", &[90], secs(90)),
+            ("shortened mid-wait", &[3600, 60], secs(60)),
+            ("shortened below elapsed", &[3600, 3600, 90], secs(120)),
+        ];
+        for (case, reads, expected) in cases {
+            let shutdown = CancellationToken::new();
+            let mut reads = reads.iter().copied().map(secs);
+            let mut last = secs(0);
+            let start = tokio::time::Instant::now();
+            let interval = || {
+                last = reads.next().unwrap_or(last);
+                std::future::ready(last)
+            };
+            assert!(
+                wait_for_trash_sweep(start, interval, &shutdown).await,
+                "{case}"
+            );
+            assert_eq!(start.elapsed(), expected, "{case}");
+        }
+
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let never = || std::future::ready(secs(3600));
+        assert!(!wait_for_trash_sweep(tokio::time::Instant::now(), never, &shutdown).await);
+    }
 
     // Every arm of the mode -> gate mapping, including the two that were never the reported
     // bug.

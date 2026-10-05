@@ -66,14 +66,14 @@ pub(crate) const SESSION_IDENTITY_EXTENSION: &str =
     include_str!("../../../assets/session/aoe-session-id.js");
 
 pub(crate) use accessors::resolved_agent_for;
-pub use flags::{is_valid_session_color, SessionBucket, SESSION_COLORS};
+pub use flags::{is_valid_session_color, SessionBucket, StartBlocked, SESSION_COLORS};
 #[cfg(test)]
 pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
 pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 
 pub use polling::PollerStart;
-pub use ready::{EnsureReadyError, EnsureReadyOutcome};
+pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
 pub(crate) use resume::ResumeAttemptPolicy;
 pub(crate) use sid_persist::{persist_session_to_storage, SidPersistOutcome, SidWrite};
 pub use start::{LaunchSidOutcome, StartOutcome};
@@ -117,7 +117,10 @@ pub(crate) use types::{
 
 // Sibling items the submodules reach through `use super::*`.
 use hooks::status_hook_env_prefix;
-pub(crate) use hooks::{generic_host_config_path_for, sidecar_host_config_path_for};
+pub(crate) use hooks::{
+    host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
+    host_hook_post_install_notes,
+};
 use launch_command::{
     append_resume_flags, build_fork_flags, parse_launch_command, shell_stdin_command,
     splice_subcommand_or_append, PreparedLaunch,
@@ -168,6 +171,10 @@ pub struct Instance {
     /// Last title written by the automatic renamer; a manual rename leaves it stale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_auto_title: Option<String>,
+    /// The title was typed in the New Session dialog, so the first launch gives it to the agent
+    /// as its own session name and clears this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub first_launch_names_agent: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub smart_rename_attempted: bool,
     pub project_path: String,
@@ -317,6 +324,9 @@ pub struct Instance {
     pub base_branch_override: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    /// Position within its group under `SortOrder::Custom`. `None` sorts last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_index: Option<u32>,
     #[serde(default, skip_serializing_if = "View::is_terminal")]
     pub view: View,
     #[serde(default, skip_serializing_if = "Option::is_none")]
